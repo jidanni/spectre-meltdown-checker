@@ -10,6 +10,28 @@
 #
 VERSION='0.34'
 
+trap 'exit_cleanup' EXIT
+trap '_warn "interrupted, cleaning up..."; exit_cleanup; exit 1' INT
+exit_cleanup()
+{
+	# cleanup the temp decompressed config & kernel image
+	[ -n "$dumped_config" ] && [ -f "$dumped_config" ] && rm -f "$dumped_config"
+	[ -n "$vmlinuxtmp"    ] && [ -f "$vmlinuxtmp"    ] && rm -f "$vmlinuxtmp"
+	# this'll umount only if we mounted debugfs ourselves
+	if [ "$mounted_debugfs" = 1 ]; then
+		umount /sys/kernel/debug
+	fi
+	# if we used modprobe ourselves, rmmod the modules
+	if [ "$insmod_cpuid" = 1 ]; then
+		rmmod cpuid 2>/dev/null
+		_debug "attempted to unload module cpuid, ret=$?"
+	fi
+	if [ "$insmod_msr" = 1 ]; then
+		rmmod msr 2>/dev/null
+		_debug "attempted to unload module msr, ret=$?"
+	fi
+}
+
 show_usage()
 {
 	# shellcheck disable=SC2086
@@ -306,7 +328,7 @@ is_cpu_specex_free()
 	# { X86_VENDOR_INTEL,     5 },
 	# { X86_VENDOR_NSC,       5 },
 	# { X86_VENDOR_ANY,       4 },
-	set -u
+	parse_cpu_details
 	if [ "$cpu_vendor" = GenuineIntel ]; then
 		if [ "$cpu_family" = 6 ]; then
 			if [ "$cpu_model" = "$INTEL_FAM6_ATOM_CEDARVIEW"  ]      || \
@@ -314,15 +336,12 @@ is_cpu_specex_free()
 				[ "$cpu_model" = "$INTEL_FAM6_ATOM_LINCROFT"   ] || \
 				[ "$cpu_model" = "$INTEL_FAM6_ATOM_PENWELL"    ] || \
 				[ "$cpu_model" = "$INTEL_FAM6_ATOM_PINEVIEW"   ]; then
-				set +u
 				return 0
 			fi
 		elif [ "$cpu_family" = 5 ]; then
-			set +u
 			return 0
 		fi
 	fi
-	set +u
 	[ "$cpu_family" -eq 4 ] && return 0
 	return 1
 }
@@ -572,8 +591,6 @@ extract_vmlinux()
 	[ -n "$1" ] || return 1
 	# Prepare temp files:
 	vmlinuxtmp="$(mktemp /tmp/vmlinux-XXXXXX)"
-	# single quotes in trap cmd: will be expanded when signalled
-	trap 'rm -f $vmlinuxtmp' EXIT INT
 
 	# Initial attempt for uncompressed images or objects:
 	if check_vmlinux "$1"; then
@@ -602,42 +619,16 @@ mount_debugfs()
 	fi
 }
 
-umount_debugfs()
-{
-	if [ "$mounted_debugfs" = 1 ]; then
-		# umount debugfs if we did mount it ourselves
-		umount /sys/kernel/debug
-	fi
-}
-
 load_msr()
 {
 	modprobe msr 2>/dev/null && insmod_msr=1
 	_debug "attempted to load module msr, insmod_msr=$insmod_msr"
 }
 
-unload_msr()
-{
-	if [ "$insmod_msr" = 1 ]; then
-		# if we used modprobe ourselves, rmmod the module
-		rmmod msr 2>/dev/null
-		_debug "attempted to unload module msr, ret=$?"
-	fi
-}
-
 load_cpuid()
 {
 	modprobe cpuid 2>/dev/null && insmod_cpuid=1
 	_debug "attempted to load module cpuid, insmod_cpuid=$insmod_cpuid"
-}
-
-unload_cpuid()
-{
-	if [ "$insmod_cpuid" = 1 ]; then
-		# if we used modprobe ourselves, rmmod the module
-		rmmod cpuid 2>/dev/null
-		_debug "attempted to unload module cpuid, ret=$?"
-	fi
 }
 
 read_cpuid()
@@ -694,6 +685,7 @@ is_coreos()
 
 parse_cpu_details()
 {
+	[ "$parse_cpu_details_done" = 1 ] && return 0
 	cpu_vendor=$(  grep '^vendor_id'  /proc/cpuinfo | awk '{print $3}' | head -1)
 	cpu_friendly_name=$(grep '^model name' /proc/cpuinfo | cut -d: -f2- | head -1 | sed -e 's/^ *//')
 	# special case for ARM follows
@@ -780,10 +772,12 @@ parse_cpu_details()
 	INTEL_FAM6_XEON_PHI_KNL=$(( 0x57 ))
 	INTEL_FAM6_XEON_PHI_KNM=$(( 0x85 ))
 	}
+	parse_cpu_details_done=1
 }
 
 is_ucode_blacklisted()
 {
+	parse_cpu_details
 	# if it's not an Intel, don't bother: it's not blacklisted
 	[ "$cpu_vendor" = GenuineIntel ] || return 1
 	# it also needs to be family=6
@@ -792,7 +786,6 @@ is_ucode_blacklisted()
 	# source: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/kernel/cpu/intel.c#n105
 	# model,stepping,microcode
 	ucode_found="model $cpu_model stepping $cpu_stepping ucode $cpu_ucode"
-	set -u
 	for tuple in \
 		$INTEL_FAM6_KABYLAKE_DESKTOP,0x0B,0x84 \
 		$INTEL_FAM6_KABYLAKE_DESKTOP,0x0A,0x84 \
@@ -823,12 +816,36 @@ is_ucode_blacklisted()
 		ucode=$(echo $tuple | cut -d, -f3)
 		if [ "$cpu_model" = "$model" ] && [ "$cpu_stepping" = "$stepping" ] && echo "$cpu_ucode" | grep -qi "^$ucode$"; then
 			_debug "is_ucode_blacklisted: we have a match! ($cpu_model/$cpu_stepping/$cpu_ucode)"
-			set +u
 			return 0
 		fi
 	done
-	set +u
 	_debug "is_ucode_blacklisted: no ($cpu_model/$cpu_stepping/$cpu_ucode)"
+	return 1
+}
+
+is_skylake_cpu()
+{
+	# is this a skylake cpu?
+	# return 0 if yes, 1 otherwise
+	#if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL &&
+	#	    boot_cpu_data.x86 == 6) {
+	#		switch (boot_cpu_data.x86_model) {
+	#		case INTEL_FAM6_SKYLAKE_MOBILE:
+	#		case INTEL_FAM6_SKYLAKE_DESKTOP:
+	#		case INTEL_FAM6_SKYLAKE_X:
+	#		case INTEL_FAM6_KABYLAKE_MOBILE:
+	#		case INTEL_FAM6_KABYLAKE_DESKTOP:
+	#			return true;
+	parse_cpu_details
+	[ "$cpu_vendor" = GenuineIntel ] || return 1
+	[ "$cpu_family" = 6 ] || return 1
+	if [ "$cpu_model" = $INTEL_FAM6_SKYLAKE_MOBILE        ] || \
+		[ "$cpu_model" = $INTEL_FAM6_SKYLAKE_DESKTOP  ] || \
+		[ "$cpu_model" = $INTEL_FAM6_SKYLAKE_X        ] || \
+		[ "$cpu_model" = $INTEL_FAM6_KABYLAKE_MOBILE  ] || \
+		[ "$cpu_model" = $INTEL_FAM6_KABYLAKE_DESKTOP ]; then
+		return 0
+	fi
 	return 1
 }
 
@@ -853,9 +870,6 @@ if [ "$opt_coreos" = 1 ]; then
 	mount_debugfs
 	toolbox --ephemeral --bind-ro /dev/cpu:/dev/cpu -- sh -c "dnf install -y binutils which && /media/root$PWD/$0 $* --coreos-within-toolbox"
 	exitcode=$?
-	mount_debugfs
-	unload_cpuid
-	unload_msr
 	exit $exitcode
 else
 	if is_coreos; then
@@ -864,10 +878,9 @@ else
 	fi
 fi
 
-# root check (only for live mode, for offline mode, we already checked if we could read the files)
-
 parse_cpu_details
 if [ "$opt_live" = 1 ]; then
+	# root check (only for live mode, for offline mode, we already checked if we could read the files)
 	if [ "$(id -u)" -ne 0 ]; then
 		_warn "Note that you should launch this script with root privileges to get accurate information."
 		_warn "We'll proceed but you might see permission denied errors."
@@ -933,6 +946,7 @@ if [ "$opt_live" = 1 ]; then
 	fi
 else
 	_info "Checking for vulnerabilities against specified kernel"
+	_info "CPU is \033[35m$cpu_friendly_name\033[0m"
 fi
 
 if [ -n "$opt_kernel" ]; then
@@ -972,6 +986,8 @@ if [ -e "$opt_kernel" ]; then
 	if ! which readelf >/dev/null 2>&1; then
 		_debug "readelf not found"
 		vmlinux_err="missing 'readelf' tool, please install it, usually it's in the 'binutils' package"
+	elif [ "$opt_sysfs_only" = 1 ]; then
+		vmlinux_err='kernel image decompression skippee'
 	else
 		extract_vmlinux "$opt_kernel"
 	fi
@@ -981,6 +997,18 @@ else
 fi
 if [ -z "$vmlinux" ] || [ ! -r "$vmlinux" ]; then
 	[ -z "$vmlinux_err" ] && vmlinux_err="couldn't extract your kernel from $opt_kernel"
+else
+	vmlinux_version=$(strings "$vmlinux" 2>/dev/null | grep '^Linux version ' | head -1)
+	if [ -n "$vmlinux_version" ]; then
+		_verbose "Kernel image is \033[35m$vmlinux_version"
+		# in live mode, check if the img we found is the correct one
+		if [ "$opt_live" = 1 ]; then
+			if ! echo "$vmlinux_version" | grep -qF "$(uname -r)" || \
+				! echo "$vmlinux_version" | grep -qF "$(uname -v)"; then
+				_warn "Possible disrepancy between your running kernel and the image we found ($opt_kernel), results might be incorrect"
+			fi
+		fi
+	fi
 fi
 
 _info
@@ -1418,9 +1446,7 @@ check_variant2()
 						;;
 					0)
 						pstatus red NO
-						if [ "$opt_verbose" -ge 2 ]; then
-							_info "    - To enable, \`echo 1 > $ibrs_knob_dir/ibrs_enabled' as root. If you don't have hardware support, you'll get an error."
-						fi
+						_verbose "    - To enable, \`echo 1 > $ibrs_knob_dir/ibrs_enabled' as root. If you don't have hardware support, you'll get an error."
 						;;
 					1 | 2) pstatus green YES;;
 					*)     pstatus yellow UNKNOWN;;
@@ -1446,9 +1472,7 @@ check_variant2()
 						;;
 					0 | 1)
 						pstatus red NO
-						if [ "$opt_verbose" -ge 2 ]; then
-							_info "    - To enable, \`echo 2 > $ibrs_knob_dir/ibrs_enabled' as root. If you don't have hardware support, you'll get an error."
-						fi
+						_verbose "    - To enable, \`echo 2 > $ibrs_knob_dir/ibrs_enabled' as root. If you don't have hardware support, you'll get an error."
 						;;
 					2) pstatus green YES;;
 					*) pstatus yellow UNKNOWN;;
@@ -1470,9 +1494,7 @@ check_variant2()
 					;;
 				0)
 					pstatus red NO
-					if [ "$opt_verbose" -ge 2 ]; then
-						_info "    - To enable, \`echo 1 > $ibrs_knob_dir/ibpb_enabled' as root. If you don't have hardware support, you'll get an error."
-					fi
+					_verbose "    - To enable, \`echo 1 > $ibrs_knob_dir/ibpb_enabled' as root. If you don't have hardware support, you'll get an error."
 					;;
 				1) pstatus green YES;;
 				2) pstatus green YES "IBPB used instead of IBRS in all kernel entrypoints";;
@@ -1833,15 +1855,6 @@ if [ "$opt_variant3" = 1 ] || [ "$opt_allvariants" = 1 ]; then
 fi
 
 _info "A false sense of security is worse than no security at all, see --disclaimer"
-
-# this'll umount only if we mounted debugfs ourselves
-umount_debugfs
-# same for modules
-unload_msr
-unload_cpuid
-
-# cleanup the temp decompressed config
-[ -n "$dumped_config" ] && [ -f "$dumped_config" ] && rm -f "$dumped_config"
 
 if [ "$opt_batch" = 1 ] && [ "$opt_batch_format" = "nrpe" ]; then
 	if [ ! -z "$nrpe_vuln" ]; then
